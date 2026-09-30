@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-DOS BLE Terminal</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: #000;
+    color: #0f0;
+    font-family: 'Courier New', Courier, monospace;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+#header {
+    background: #003300;
+    padding: 8px 16px;
+    border-bottom: 2px solid #0f0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+}
+#header h1 {
+    font-size: 16px;
+    color: #0f0;
+}
+#status {
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 4px;
+}
+.connected { background: #0f0; color: #000; }
+.disconnected { background: #f00; color: #fff; }
+#connect-btn {
+    background: #0f0;
+    color: #000;
+    border: none;
+    padding: 6px 16px;
+    cursor: pointer;
+    font-family: monospace;
+    font-weight: bold;
+    border-radius: 4px;
+    margin-left: 10px;
+}
+#connect-btn:hover { background: #0c0; }
+#connect-btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+#terminal {
+    flex: 1;
+    overflow-y: auto;
+    padding: 10px;
+    font-size: 14px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+#terminal::-webkit-scrollbar { width: 8px; }
+#terminal::-webkit-scrollbar-track { background: #000; }
+#terminal::-webkit-scrollbar-thumb { background: #0f0; border-radius: 4px; }
+#input-line {
+    display: flex;
+    padding: 8px 10px;
+    border-top: 2px solid #0f0;
+    background: #001100;
+    flex-shrink: 0;
+}
+#prompt {
+    color: #0f0;
+    font-weight: bold;
+    margin-right: 8px;
+    white-space: nowrap;
+}
+#cmd-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: #0f0;
+    font-family: monospace;
+    font-size: 14px;
+    outline: none;
+}
+#help-panel {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #001100;
+    border: 2px solid #0f0;
+    padding: 20px;
+    max-width: 500px;
+    width: 90%;
+    display: none;
+    z-index: 100;
+    border-radius: 8px;
+}
+#help-panel h2 { color: #0f0; margin-bottom: 10px; font-size: 18px; }
+#help-panel p { margin: 5px 0; font-size: 13px; }
+#help-panel .close-btn {
+    position: absolute;
+    top: 8px;
+    right: 12px;
+    color: #f00;
+    cursor: pointer;
+    font-size: 20px;
+    font-weight: bold;
+}
+#help-btn {
+    background: transparent;
+    border: 1px solid #0f0;
+    color: #0f0;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-family: monospace;
+    border-radius: 4px;
+    margin-left: 10px;
+}
+#help-btn:hover { background: #0f0; color: #000; }
+.cursor-blink {
+    display: inline-block;
+    width: 8px;
+    height: 14px;
+    background: #0f0;
+    animation: blink 1s infinite;
+    vertical-align: middle;
+}
+@keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+
+<div id="header">
+    <h1>ESP32-DOS BLE Remote Terminal</h1>
+    <div style="display:flex;align-items:center;">
+        <span id="status" class="disconnected">DISCONNECTED</span>
+        <button id="connect-btn" onclick="connect()">Connect</button>
+        <button id="help-btn" onclick="showHelp()">Help</button>
+    </div>
+</div>
+
+<div id="terminal"></div>
+
+<div id="input-line">
+    <span id="prompt">C:\></span>
+    <input type="text" id="cmd-input" placeholder="Type command and press Enter..." autocomplete="off" autofocus>
+</div>
+
+<div id="help-panel">
+    <span class="close-btn" onclick="hideHelp()">X</span>
+    <h2>ESP32-DOS BLE Terminal Help</h2>
+    <p><b>Connect:</b> Click "Connect" and select "ESP32-DOS" from the Bluetooth device list.</p>
+    <p><b>Usage:</b> Type DOS commands in the input box and press Enter to execute.</p>
+    <p><b>WiFi Setup:</b></p>
+    <p>&nbsp;&nbsp;WIFI SCAN - Scan available networks</p>
+    <p>&nbsp;&nbsp;WIFI &lt;SSID&gt; &lt;password&gt; - Connect to WiFi</p>
+    <p>&nbsp;&nbsp;WEBCONFIG - Start web config portal (AP mode)</p>
+    <p><b>Download:</b></p>
+    <p>&nbsp;&nbsp;WGET &lt;url&gt; - Download file from HTTP</p>
+    <p><b>BLE:</b></p>
+    <p>&nbsp;&nbsp;BLE STATUS - Show BLE status</p>
+    <p><b>Note:</b> Requires Chrome/Edge browser with Web Bluetooth support. Mobile Chrome on Android is supported.</p>
+</div>
+
+<script>
+// BLE UART Service UUIDs
+const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX_CHAR_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // ESP32 RX (we write)
+const TX_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // ESP32 TX (we notify)
+
+let bleDevice = null;
+let bleServer = null;
+let bleService = null;
+let rxChar = null;
+let txChar = null;
+let connected = false;
+let history = [];
+let historyIndex = -1;
+
+const terminal = document.getElementById('terminal');
+const cmdInput = document.getElementById('cmd-input');
+const statusEl = document.getElementById('status');
+const connectBtn = document.getElementById('connect-btn');
+const promptEl = document.getElementById('prompt');
+
+function log(text, isCommand = false) {
+    const span = document.createElement('span');
+    if (isCommand) {
+        span.style.color = '#0f0';
+        span.style.fontWeight = 'bold';
+    }
+    span.textContent = text;
+    terminal.appendChild(span);
+    terminal.scrollTop = terminal.scrollHeight;
+}
+
+function logHTML(html) {
+    const div = document.createElement('div');
+    div.innerHTML = html;
+    terminal.appendChild(div);
+    terminal.scrollTop = terminal.scrollHeight;
+}
+
+function clearTerminal() {
+    terminal.innerHTML = '';
+}
+
+// 处理 ANSI 转义序列（简化版）
+function processANSI(text) {
+    // 清屏
+    if (text.includes('\x1b[2J')) {
+        clearTerminal();
+        text = text.replace(/\x1b\[2J/g, '');
+    }
+    // 光标归位
+    text = text.replace(/\x1b\[H/g, '');
+    // 清除行
+    text = text.replace(/\x1b\[2K/g, '');
+    // 光标移动（简化：忽略）
+    text = text.replace(/\x1b\[\d+[ABCD]/g, '');
+    text = text.replace(/\x1b\[\d+;\d+H/g, '');
+    // 颜色（简化：忽略）
+    text = text.replace(/\x1b\[\d+(;\d+)*m/g, '');
+    // 其他转义
+    text = text.replace(/\x1b\[\?25[lh]/g, '');
+    text = text.replace(/\x1b\[su/g, '');
+    return text;
+}
+
+async function connect() {
+    if (connected) {
+        disconnect();
+        return;
+    }
+    try {
+        log('Requesting Bluetooth Device...\n');
+        bleDevice = await navigator.bluetooth.requestDevice({
+            filters: [{ namePrefix: 'ESP32' }],
+            optionalServices: [SERVICE_UUID]
+        });
+        log('Device found: ' + bleDevice.name + '\n');
+        bleDevice.addEventListener('gattserverdisconnected', onDisconnected);
+        log('Connecting to GATT Server...\n');
+        bleServer = await bleDevice.gatt.connect();
+        log('Getting Service...\n');
+        bleService = await bleServer.getPrimaryService(SERVICE_UUID);
+        log('Getting Characteristics...\n');
+        rxChar = await bleService.getCharacteristic(RX_CHAR_UUID);
+        txChar = await bleService.getCharacteristic(TX_CHAR_UUID);
+        log('Subscribing to notifications...\n');
+        await txChar.startNotifications();
+        txChar.addEventListener('characteristicvaluechanged', onDataReceived);
+        connected = true;
+        statusEl.textContent = 'CONNECTED';
+        statusEl.className = 'connected';
+        connectBtn.textContent = 'Disconnect';
+        log('\n=== Connected to ESP32-DOS ===\n\n');
+        cmdInput.focus();
+    } catch (error) {
+        log('Error: ' + error.message + '\n');
+        if (error.name === 'NotFoundError') {
+            log('Make sure ESP32 is powered on and BLE is active.\n');
+        }
+    }
+}
+
+function disconnect() {
+    if (bleDevice) {
+        bleDevice.gatt.disconnect();
+    }
+}
+
+function onDisconnected() {
+    connected = false;
+    statusEl.textContent = 'DISCONNECTED';
+    statusEl.className = 'disconnected';
+    connectBtn.textContent = 'Connect';
+    log('\n=== Disconnected ===\n');
+}
+
+function onDataReceived(event) {
+    const value = event.target.value;
+    const decoder = new TextDecoder('utf-8');
+    let text = decoder.decode(value);
+    text = processANSI(text);
+    // 处理 \r\n
+    log(text);
+}
+
+async function sendCommand(cmd) {
+    if (!connected || !rxChar) {
+        log('Not connected!\n');
+        return;
+    }
+    // 分块发送（BLE 单次最多 20 字节）
+    const data = cmd + '\r';
+    const encoder = new TextEncoder();
+    const bytes = encoder.encode(data);
+    const chunkSize = 20;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        const chunk = bytes.slice(i, i + chunkSize);
+        await rxChar.writeValue(chunk);
+    }
+}
+
+cmdInput.addEventListener('keydown', async (e) => {
+    if (e.key === 'Enter') {
+        const cmd = cmdInput.value.trim();
+        if (cmd.length > 0) {
+            log(promptEl.textContent + cmd + '\n', true);
+            history.push(cmd);
+            historyIndex = history.length;
+            await sendCommand(cmd);
+        }
+        cmdInput.value = '';
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (historyIndex > 0) {
+            historyIndex--;
+            cmdInput.value = history[historyIndex];
+        }
+    } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (historyIndex < history.length - 1) {
+            historyIndex++;
+            cmdInput.value = history[historyIndex];
+        } else {
+            historyIndex = history.length;
+            cmdInput.value = '';
+        }
+    } else if (e.key === 'Tab') {
+        e.preventDefault();
+        // Tab 补全（简化）
+    }
+});
+
+function showHelp() {
+    document.getElementById('help-panel').style.display = 'block';
+}
+
+function hideHelp() {
+    document.getElementById('help-panel').style.display = 'none';
+}
+
+// 点击终端区域聚焦输入框
+terminal.addEventListener('click', () => cmdInput.focus());
+
+// 检查浏览器支持
+if (!navigator.bluetooth) {
+    log('WARNING: Web Bluetooth API is not supported in this browser.\n');
+    log('Please use Chrome, Edge, or Opera on desktop, or Chrome on Android.\n\n');
+    connectBtn.disabled = true;
+}
+
+// 初始欢迎信息
+log('ESP32-DOS BLE Remote Terminal v1.0\n');
+log('====================================\n\n');
+log('Click "Connect" to pair with your ESP32 via Bluetooth.\n');
+log('Make sure the ESP32 is powered on and running the DOS firmware.\n\n');
+log('The device name should appear as "ESP32-DOS".\n\n');
+</script>
+</body>
+</html>
